@@ -1,8 +1,10 @@
 import { strFromU8, strToU8, unzipSync, zipSync } from "fflate";
+import { DOMParser, XMLSerializer } from "@xmldom/xmldom";
+import type { Document, Element } from "@xmldom/xmldom";
 import { isRtlLanguage } from "@/lib/languages";
 import type { PreparedFile } from "./types";
 import { getExtension, translatedName } from "./types";
-import { decodeXml, escapeXml, hasLetters } from "./utils";
+import { hasLetters } from "./utils";
 
 type PartPlan = {
   path: string;
@@ -18,10 +20,6 @@ function isEmptyText(text: string) {
 function ensurePreserve(attributes: string) {
   return /xml:space\s*=/.test(attributes) ? attributes : `${attributes} xml:space="preserve"`;
 }
-
-/* -------------------------------------------------------------------------- */
-/*                                    DOCX                                    */
-/* -------------------------------------------------------------------------- */
 
 function splitByRuns(text: string, runLengths: number[]): string[] {
   if (runLengths.length === 0) return [];
@@ -39,34 +37,73 @@ function splitByRuns(text: string, runLengths: number[]): string[] {
   return parts;
 }
 
+const W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const X_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+function getLocalName(node: Element | null): string {
+  if (!node) return "";
+  return node.localName || node.nodeName.split(":").pop() || "";
+}
+
+function getElements(parent: Element, namespaceURI: string | null, localName: string): Element[] {
+  const elements = parent.getElementsByTagNameNS(namespaceURI, localName);
+  if (elements.length > 0) return Array.from(elements);
+  const fallback = parent.getElementsByTagName(localName);
+  if (fallback.length > 0) return Array.from(fallback);
+  const prefixed = parent.getElementsByTagName(`w:${localName}`);
+  if (prefixed.length > 0 && (localName === "p" || localName === "r" || localName === "t")) return Array.from(prefixed);
+  return [];
+}
+
+function getFirstElement(parent: Element, namespaceURI: string | null, localName: string): Element | null {
+  const elements = getElements(parent, namespaceURI, localName);
+  return elements[0] ?? null;
+}
+
+function createElement(doc: Document, namespaceURI: string, localName: string, prefix: string): Element {
+  try {
+    return doc.createElementNS(namespaceURI, `${prefix}:${localName}`);
+  } catch {
+    return doc.createElement(`${prefix}:${localName}`);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                    DOCX                                    */
+/* -------------------------------------------------------------------------- */
+
 function prepareDocxPart(xml: string): PartPlan {
+  const parser = new DOMParser();
+  const serializer = new XMLSerializer();
+  const doc = parser.parseFromString(xml, "text/xml");
+
   const segments: string[] = [];
   const plans: {
-    paragraph: string;
+    paragraph: Element;
     segmentIndex: number;
-    runs: { full: string; tAttributes: string; text: string }[];
+    runs: { element: Element; tElement: Element; text: string }[];
   }[] = [];
 
-  const runPattern = /<w:r\b[^>]*>[\s\S]*?<w:t\b([^>]*)>([\s\S]*?)<\/w:t>[\s\S]*?<\/w:r>/g;
-  const textPattern = /<w:t\b([^>]*)>([\s\S]*?)<\/w:t>/g;
+  const root = doc.documentElement;
+  const paragraphs = root ? getElements(root, W_NS, "p") : [];
+  for (const paragraph of paragraphs) {
+    const runs = getElements(paragraph, W_NS, "r");
+    const runData: { element: Element; tElement: Element; text: string }[] = [];
 
-  for (const match of xml.matchAll(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g)) {
-    const paragraph = match[0];
-    const runs: { full: string; tAttributes: string; text: string }[] = [];
-
-    for (const runMatch of paragraph.matchAll(runPattern)) {
-      runs.push({
-        full: runMatch[0],
-        tAttributes: runMatch[1] ?? "",
-        text: decodeXml(runMatch[2] ?? ""),
-      });
+    for (const run of runs) {
+      const tElement = getFirstElement(run, W_NS, "t");
+      if (!tElement) continue;
+      const text = tElement.textContent ?? "";
+      if (text.length === 0 && tElement.childNodes.length === 0) continue;
+      runData.push({ element: run, tElement, text });
     }
 
-    if (!runs.length) continue;
-    const joined = runs.map((entry) => entry.text).join("");
+    if (runData.length === 0) continue;
+    const joined = runData.map((entry) => entry.text).join("");
     if (isEmptyText(joined)) continue;
 
-    plans.push({ paragraph, segmentIndex: segments.length, runs });
+    plans.push({ paragraph, segmentIndex: segments.length, runs: runData });
     segments.push(joined);
   }
 
@@ -75,39 +112,26 @@ function prepareDocxPart(xml: string): PartPlan {
     xml,
     segments,
     rebuild(translations) {
-      let lastIndex = 0;
-      let output = "";
-
       for (const plan of plans) {
-        const paragraphIndex = xml.indexOf(plan.paragraph, lastIndex);
-        if (paragraphIndex === -1) continue;
-        output += xml.slice(lastIndex, paragraphIndex);
-        lastIndex = paragraphIndex + plan.paragraph.length;
-
         const originalJoined = plan.runs.map((entry) => entry.text).join("");
         const translated = translations[plan.segmentIndex] ?? originalJoined;
         const runLengths = plan.runs.map((entry) => entry.text.length);
         const parts = splitByRuns(translated, runLengths);
-        let runIndex = 0;
 
-        const rebuiltParagraph = plan.paragraph.replace(runPattern, (fullRun) => {
-          const run = plan.runs[runIndex];
-          runIndex += 1;
-          if (!run) return fullRun;
-          const part = parts[runIndex - 1] ?? "";
+        for (let i = 0; i < plan.runs.length; i += 1) {
+          const run = plan.runs[i];
+          const part = parts[i] ?? "";
           if (part.length === 0) {
-            return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${attributes}></w:t>`);
+            run.tElement.textContent = "";
+            continue;
           }
-          if (runIndex === 1) {
-            return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${ensurePreserve(run.tAttributes)}>${escapeXml(part)}</w:t>`);
+          run.tElement.textContent = part;
+          if (!run.tElement.getAttribute("xml:space")) {
+            run.tElement.setAttribute("xml:space", "preserve");
           }
-          return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${ensurePreserve(run.tAttributes)}>${escapeXml(part)}</w:t>`);
-        });
-
-        output += rebuiltParagraph;
+        }
       }
-      output += xml.slice(lastIndex);
-      return output;
+      return serializer.serializeToString(doc);
     },
   };
 }
@@ -117,27 +141,36 @@ function prepareDocxPart(xml: string): PartPlan {
 /* -------------------------------------------------------------------------- */
 
 function preparePptxPart(xml: string, rtl: boolean): PartPlan {
+  const parser = new DOMParser();
+  const serializer = new XMLSerializer();
+  const doc = parser.parseFromString(xml, "text/xml");
+
   const segments: string[] = [];
-  const plans: { paragraph: string; segmentIndex: number; runs: { full: string; attributes: string; text: string }[] }[] = [];
-  const runPattern = /<a:r\b[^>]*>[\s\S]*?<a:t\b([^>]*)>([\s\S]*?)<\/a:t>[\s\S]*?<\/a:r>/g;
-  const textPattern = /<a:t\b([^>]*)>([\s\S]*?)<\/a:t>/g;
+  const plans: {
+    paragraph: Element;
+    segmentIndex: number;
+    runs: { element: Element; tElement: Element; text: string }[];
+  }[] = [];
 
-  for (const match of xml.matchAll(/<a:p\b[^>]*>[\s\S]*?<\/a:p>/g)) {
-    const paragraph = match[0];
-    const runs: { full: string; attributes: string; text: string }[] = [];
+  const root = doc.documentElement;
+  const paragraphs = root ? getElements(root, A_NS, "p") : [];
+  for (const paragraph of paragraphs) {
+    const runs = getElements(paragraph, A_NS, "r");
+    const runData: { element: Element; tElement: Element; text: string }[] = [];
 
-    for (const runMatch of paragraph.matchAll(runPattern)) {
-      runs.push({
-        full: runMatch[0],
-        attributes: runMatch[1] ?? "",
-        text: decodeXml(runMatch[2] ?? ""),
-      });
+    for (const run of runs) {
+      const tElement = getFirstElement(run, A_NS, "t");
+      if (!tElement) continue;
+      const text = tElement.textContent ?? "";
+      if (text.length === 0 && tElement.childNodes.length === 0) continue;
+      runData.push({ element: run, tElement, text });
     }
 
-    if (!runs.length) continue;
-    const joined = runs.map((entry) => entry.text).join("");
+    if (runData.length === 0) continue;
+    const joined = runData.map((entry) => entry.text).join("");
     if (isEmptyText(joined)) continue;
-    plans.push({ paragraph, segmentIndex: segments.length, runs });
+
+    plans.push({ paragraph, segmentIndex: segments.length, runs: runData });
     segments.push(joined);
   }
 
@@ -146,51 +179,39 @@ function preparePptxPart(xml: string, rtl: boolean): PartPlan {
     xml,
     segments,
     rebuild(translations) {
-      let lastIndex = 0;
-      let output = "";
-
       for (const plan of plans) {
-        const paragraphIndex = xml.indexOf(plan.paragraph, lastIndex);
-        if (paragraphIndex === -1) continue;
-        output += xml.slice(lastIndex, paragraphIndex);
-        lastIndex = paragraphIndex + plan.paragraph.length;
-
         const originalJoined = plan.runs.map((entry) => entry.text).join("");
         const translated = translations[plan.segmentIndex] ?? originalJoined;
         const runLengths = plan.runs.map((entry) => entry.text.length);
         const parts = splitByRuns(translated, runLengths);
-        let runIndex = 0;
 
-        let paragraph = plan.paragraph.replace(runPattern, (fullRun) => {
-          const run = plan.runs[runIndex];
-          runIndex += 1;
-          if (!run) return fullRun;
-          const part = parts[runIndex - 1] ?? "";
+        for (let i = 0; i < plan.runs.length; i += 1) {
+          const run = plan.runs[i];
+          const part = parts[i] ?? "";
           if (part.length === 0) {
-            return fullRun.replace(textPattern, (full, attributes: string) => `<a:t${attributes}></a:t>`);
+            run.tElement.textContent = "";
+            continue;
           }
-          return fullRun.replace(textPattern, (full, attributes: string) => `<a:t${ensurePreserve(run.attributes)}>${escapeXml(part)}</a:t>`);
-        });
-
-        // اتجاه فقرة DrawingML للغات من اليمين إلى اليسار فقط.
-        if (rtl) {
-          if (/<a:pPr\b[^>]*>/.test(paragraph)) {
-            paragraph = paragraph.replace(/<a:pPr\b([^>]*)>/, (full, attributes: string) => {
-              if (/\brtl\s*=/.test(attributes)) {
-                return `<a:pPr${attributes.replace(/\brtl\s*=\s*"[^"]*"/, 'rtl="1"')}>`;
-              }
-              return `<a:pPr${attributes} rtl="1">`;
-            });
-          } else {
-            paragraph = paragraph.replace(/^<a:p\b[^>]*>/, (full) => `${full}<a:pPr rtl="1"/>`);
+          run.tElement.textContent = part;
+          if (!run.tElement.getAttribute("xml:space")) {
+            run.tElement.setAttribute("xml:space", "preserve");
           }
         }
 
-        output += paragraph;
+        if (rtl) {
+          let pPr = getFirstElement(plan.paragraph, A_NS, "pPr");
+          if (!pPr) {
+            pPr = createElement(doc, A_NS, "pPr", "a");
+            if (plan.paragraph.firstChild) {
+              plan.paragraph.insertBefore(pPr, plan.paragraph.firstChild as Element);
+            } else {
+              plan.paragraph.appendChild(pPr);
+            }
+          }
+          pPr.setAttribute("rtl", "1");
+        }
       }
-
-      output += xml.slice(lastIndex);
-      return output;
+      return serializer.serializeToString(doc);
     },
   };
 }
@@ -200,25 +221,26 @@ function preparePptxPart(xml: string, rtl: boolean): PartPlan {
 /* -------------------------------------------------------------------------- */
 
 function prepareXlsxPart(xml: string, containerTag: "si" | "is"): PartPlan {
-  const segments: string[] = [];
-  const plans: { block: string; segmentIndex: number; texts: { full: string; attributes: string; text: string }[] }[] = [];
-  const blockPattern = new RegExp(`<${containerTag}\\b[^>]*>[\\s\\S]*?</${containerTag}>`, "g");
-  const textPattern = /<t\b([^>]*)>([\s\S]*?)<\/t>/g;
+  const parser = new DOMParser();
+  const serializer = new XMLSerializer();
+  const doc = parser.parseFromString(xml, "text/xml");
 
-  for (const match of xml.matchAll(blockPattern)) {
-    const block = match[0];
-    const texts: { full: string; attributes: string; text: string }[] = [];
-    for (const textMatch of block.matchAll(textPattern)) {
-      texts.push({
-        full: textMatch[0],
-        attributes: textMatch[1] ?? "",
-        text: decodeXml(textMatch[2] ?? ""),
-      });
-    }
-    if (!texts.length) continue;
-    const joined = texts.map((entry) => entry.text).join("");
+  const segments: string[] = [];
+  const plans: {
+    container: Element;
+    segmentIndex: number;
+    texts: Element[];
+  }[] = [];
+
+  const root = doc.documentElement;
+  const containers = root ? getElements(root, X_NS, containerTag) : [];
+  for (const container of containers) {
+    const tElements = getElements(container, X_NS, "t");
+    if (tElements.length === 0) continue;
+    const texts = tElements.map((tElement) => tElement.textContent ?? "");
+    const joined = texts.join("");
     if (isEmptyText(joined)) continue;
-    plans.push({ block, segmentIndex: segments.length, texts });
+    plans.push({ container, segmentIndex: segments.length, texts: tElements });
     segments.push(joined);
   }
 
@@ -227,34 +249,26 @@ function prepareXlsxPart(xml: string, containerTag: "si" | "is"): PartPlan {
     xml,
     segments,
     rebuild(translations) {
-      let lastIndex = 0;
-      let output = "";
-
       for (const plan of plans) {
-        const blockIndex = xml.indexOf(plan.block, lastIndex);
-        if (blockIndex === -1) continue;
-        output += xml.slice(lastIndex, blockIndex);
-        lastIndex = blockIndex + plan.block.length;
-
-        const originalJoined = plan.texts.map((entry) => entry.text).join("");
+        const originalJoined = plan.texts.map((tElement) => tElement.textContent ?? "").join("");
         const translated = translations[plan.segmentIndex] ?? originalJoined;
-        const runLengths = plan.texts.map((entry) => entry.text.length);
+        const runLengths = plan.texts.map((tElement) => (tElement.textContent ?? "").length);
         const parts = splitByRuns(translated, runLengths);
-        let textCursor = 0;
 
-        output += plan.block.replace(textPattern, (full, attributes: string) => {
-          const index = textCursor;
-          textCursor += 1;
-          const part = parts[index] ?? "";
+        for (let i = 0; i < plan.texts.length; i += 1) {
+          const tElement = plan.texts[i];
+          const part = parts[i] ?? "";
           if (part.length === 0) {
-            return `<t${attributes}></t>`;
+            tElement.textContent = "";
+            continue;
           }
-          return `<t${ensurePreserve(plan.texts[index]?.attributes || attributes)}>${escapeXml(part)}</t>`;
-        });
+          tElement.textContent = part;
+          if (!tElement.getAttribute("xml:space")) {
+            tElement.setAttribute("xml:space", "preserve");
+          }
+        }
       }
-
-      output += xml.slice(lastIndex);
-      return output;
+      return serializer.serializeToString(doc);
     },
   };
 }
@@ -287,9 +301,14 @@ export function prepareOfficeFile(originalName: string, bytes: Uint8Array, targe
       /^word\/(document|header\d*|footer\d*|footnotes|endnotes)\.xml$/.test(path),
     );
     for (const path of paths) {
-      const plan = prepareDocxPart(strFromU8(files[path]));
-      plan.path = path;
-      plans.push(plan);
+      try {
+        const plan = prepareDocxPart(strFromU8(files[path]));
+        if (plan.segments.length === 0) continue;
+        plan.path = path;
+        plans.push(plan);
+      } catch {
+        // تجاهل الأجزاء التي يصعب تحليلها والمحاولة بأجزاء أخرى
+      }
     }
     if (rtl) {
       for (const plan of plans) {
@@ -298,25 +317,44 @@ export function prepareOfficeFile(originalName: string, bytes: Uint8Array, targe
     }
   } else if (extension === "pptx") {
     const paths = Object.keys(files).filter((path) =>
-      /^ppt\/(slides\/slide\d+\.xml|notesSlides\/notesSlide\d+\.xml)$/.test(path),
+      /^ppt\/(slides\/slide\d+\.xml|notesSlides\/notesSlide\d+\.xml|handoutMaster\d*\.xml)$/.test(path),
     );
     for (const path of paths) {
-      const plan = preparePptxPart(strFromU8(files[path]), rtl);
-      plan.path = path;
-      plans.push(plan);
+      try {
+        const plan = preparePptxPart(strFromU8(files[path]), rtl);
+        if (plan.segments.length === 0) continue;
+        plan.path = path;
+        plans.push(plan);
+      } catch {
+        // تجاهل
+      }
     }
   } else if (extension === "xlsx") {
     if (files["xl/sharedStrings.xml"]) {
-      const plan = prepareXlsxPart(strFromU8(files["xl/sharedStrings.xml"]), "si");
-      plan.path = "xl/sharedStrings.xml";
-      plans.push(plan);
+      try {
+        const plan = prepareXlsxPart(strFromU8(files["xl/sharedStrings.xml"]), "si");
+        if (plan.segments.length > 0) {
+          plan.path = "xl/sharedStrings.xml";
+          plans.push(plan);
+        }
+      } catch {
+        // تجاهل
+      }
     }
     for (const path of Object.keys(files).filter((entry) => /^xl\/worksheets\/sheet\d+\.xml$/.test(entry))) {
-      const xml = strFromU8(files[path]);
-      if (!/<is\b/.test(xml)) continue;
-      const plan = prepareXlsxPart(xml, "is");
-      plan.path = path;
-      plans.push(plan);
+      try {
+        const xml = strFromU8(files[path]);
+        if (!/<is\b/.test(xml) && !/<t\b/.test(xml)) continue;
+        if (/<is\b/.test(xml)) {
+          const plan = prepareXlsxPart(xml, "is");
+          if (plan.segments.length > 0) {
+            plan.path = path;
+            plans.push(plan);
+          }
+        }
+      } catch {
+        // تجاهل
+      }
     }
   } else {
     throw new Error("صيغة Office غير مدعومة.");
@@ -341,7 +379,7 @@ export function prepareOfficeFile(originalName: string, bytes: Uint8Array, targe
     extension,
     segments,
     characters: segments.reduce((total, segment) => total + segment.length, 0),
-    note: rtl ? "حُفظ الملف الأصلي مع ضبط اتجاه الفقرات للعربية." : "حُفظ تنسيق الملف الأصلي قدر الإمكان.",
+    note: rtl ? "حُفظ الملف الأصلي مع الحفاظ على التنسيق وضبط اتجاه الفقرات للعربية." : "حُفظ تنسيق الملف الأصلي قدر الإمكان.",
     async rebuild(translations) {
       plans.forEach((plan, index) => {
         const offset = offsets[index];
@@ -349,17 +387,34 @@ export function prepareOfficeFile(originalName: string, bytes: Uint8Array, targe
         files[plan.path] = strToU8(plan.rebuild(local));
       });
       const zipped = zipSync(files, { level: 6 });
-      return new Blob([zipped], { type: MIME[extension] ?? "application/octet-stream" });
+      return new Blob([zipped.buffer.slice(zipped.byteOffset, zipped.byteOffset + zipped.byteLength)], { type: MIME[extension] ?? "application/octet-stream" });
     },
   };
 }
 
 function applyDocxBidi(xml: string) {
-  return xml.replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, (paragraph) => {
-    if (/<w:bidi\s*\/>/.test(paragraph)) return paragraph;
-    if (/<w:pPr\b[^>]*>/.test(paragraph)) {
-      return paragraph.replace(/<w:pPr\b([^>]*)>/, (full, attributes: string) => `<w:pPr${attributes}><w:bidi/>`);
+  const parser = new DOMParser();
+  const serializer = new XMLSerializer();
+  const doc = parser.parseFromString(xml, "text/xml");
+  const root = doc.documentElement;
+  const paragraphs = root ? getElements(root, W_NS, "p") : [];
+
+  for (const paragraph of paragraphs) {
+    if (getFirstElement(paragraph, W_NS, "bidi")) continue;
+    let pPr = getFirstElement(paragraph, W_NS, "pPr");
+    if (!pPr) {
+      pPr = createElement(doc, W_NS, "pPr", "w");
+      if (paragraph.firstChild && paragraph.firstChild.nodeType === 1) {
+        paragraph.insertBefore(pPr, paragraph.firstChild as Element);
+      } else if (paragraph.firstChild) {
+        paragraph.insertBefore(pPr, paragraph.firstChild);
+      } else {
+        paragraph.appendChild(pPr);
+      }
     }
-    return paragraph.replace(/^<w:p\b[^>]*>/, (full) => `${full}<w:pPr><w:bidi/></w:pPr>`);
-  });
+    const bidi = createElement(doc, W_NS, "bidi", "w");
+    pPr.appendChild(bidi);
+  }
+
+  return serializer.serializeToString(doc);
 }
