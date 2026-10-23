@@ -20,8 +20,8 @@ const plexArabic = IBM_Plex_Sans_Arabic({
 export const metadata: Metadata = {
   metadataBase: new URL(site.url),
   title: {
-    default: `${site.name} — ${site.tagline}`,
-    template: `%s | ${site.name}`,
+    default: "تَرجِم | ترجمة نصوص وملفات مجانية بين أكثر من ٧٨ لغة",
+    template: `%s | تَرجِم`,
   },
   description: site.description,
   applicationName: site.name,

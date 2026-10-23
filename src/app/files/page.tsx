@@ -14,10 +14,10 @@ import { site } from "@/lib/site";
 export const metadata: Metadata = {
   title: "ترجمة الملفات",
   description:
-    "ترجم Word وExcel وPowerPoint وPDF والنصوص والترجمة المرئية مع الحفاظ على التنسيق. ملفات Office تُعالَج داخل متصفحك ولا تُرفع إلى خوادمنا.",
+    "ترجم ملفات Word وExcel وPowerPoint وPDF والنصوص وغيرها بين أكثر من ٧٨ لغة مع الحفاظ على التنسيق. ملفات Office تُعالَج داخل متصفحك ولا تُرفع إلى الخادم.",
   alternates: { canonical: "/files" },
   openGraph: {
-    title: `ترجمة الملفات | ${site.name}`,
+    title: `ترجمة الملفات | تَرجِم`,
     description: "ارفع ملفك واحصل على نسخة مترجمة بصيغته الأصلية، أو PDF كملف Word قابل للتعديل.",
   },
 };

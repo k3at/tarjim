@@ -2,6 +2,7 @@
   "name": "tarjim",
   "version": "0.1.0",
   "private": true,
+  "description": "تَرجِم - ترجمة نصوص وملفات مجانية بين أكثر من ٧٨ لغة مع الحفاظ على التنسيق ودون تسجيل",
   "packageManager": "pnpm@12.15.0",
   "engines": {
     "node": ">=20.9.0"

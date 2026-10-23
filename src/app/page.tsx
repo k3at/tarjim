@@ -11,7 +11,7 @@ import { LANGUAGES, POPULAR_LANGUAGES } from "@/lib/languages";
 import { site } from "@/lib/site";
 
 export const metadata: Metadata = {
-  title: `${site.name} — ${site.tagline}`,
+  title: "تَرجِم | ترجمة نصوص وملفات مجانية بين أكثر من ٧٨ لغة",
   description: site.description,
   alternates: { canonical: "/" },
 };
