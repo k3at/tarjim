@@ -23,33 +23,50 @@ function ensurePreserve(attributes: string) {
 /*                                    DOCX                                    */
 /* -------------------------------------------------------------------------- */
 
+function splitByRuns(text: string, runLengths: number[]): string[] {
+  if (runLengths.length === 0) return [];
+  const parts: string[] = [];
+  let cursor = 0;
+  for (let i = 0; i < runLengths.length; i += 1) {
+    const length = runLengths[i];
+    if (i === runLengths.length - 1) {
+      parts.push(text.slice(cursor));
+      break;
+    }
+    parts.push(text.slice(cursor, cursor + length));
+    cursor += length;
+  }
+  return parts;
+}
+
 function prepareDocxPart(xml: string): PartPlan {
   const segments: string[] = [];
   const plans: {
     paragraph: string;
     segmentIndex: number;
-    texts: { full: string; attributes: string; text: string }[];
+    runs: { full: string; tAttributes: string; text: string }[];
   }[] = [];
 
+  const runPattern = /<w:r\b[^>]*>[\s\S]*?<w:t\b([^>]*)>([\s\S]*?)<\/w:t>[\s\S]*?<\/w:r>/g;
   const textPattern = /<w:t\b([^>]*)>([\s\S]*?)<\/w:t>/g;
 
   for (const match of xml.matchAll(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g)) {
     const paragraph = match[0];
-    const texts: { full: string; attributes: string; text: string }[] = [];
+    const runs: { full: string; tAttributes: string; text: string }[] = [];
 
-    for (const textMatch of paragraph.matchAll(textPattern)) {
-      texts.push({
-        full: textMatch[0],
-        attributes: textMatch[1] ?? "",
-        text: decodeXml(textMatch[2] ?? ""),
+    for (const runMatch of paragraph.matchAll(runPattern)) {
+      runs.push({
+        full: runMatch[0],
+        tAttributes: runMatch[1] ?? "",
+        text: decodeXml(runMatch[2] ?? ""),
       });
     }
 
-    if (!texts.length) continue;
-    const joined = texts.map((entry) => entry.text).join("");
+    if (!runs.length) continue;
+    const joined = runs.map((entry) => entry.text).join("");
     if (isEmptyText(joined)) continue;
 
-    plans.push({ paragraph, segmentIndex: segments.length, texts });
+    plans.push({ paragraph, segmentIndex: segments.length, runs });
     segments.push(joined);
   }
 
@@ -67,16 +84,27 @@ function prepareDocxPart(xml: string): PartPlan {
         output += xml.slice(lastIndex, paragraphIndex);
         lastIndex = paragraphIndex + plan.paragraph.length;
 
-        const translated = translations[plan.segmentIndex] ?? plan.texts.map((entry) => entry.text).join("");
-        let textCursor = 0;
-        output += plan.paragraph.replace(textPattern, (full, attributes: string) => {
-          const index = textCursor;
-          textCursor += 1;
-          if (index === 0) {
-            return `<w:t${ensurePreserve(attributes)}>${escapeXml(translated)}</w:t>`;
+        const originalJoined = plan.runs.map((entry) => entry.text).join("");
+        const translated = translations[plan.segmentIndex] ?? originalJoined;
+        const runLengths = plan.runs.map((entry) => entry.text.length);
+        const parts = splitByRuns(translated, runLengths);
+        let runIndex = 0;
+
+        const rebuiltParagraph = plan.paragraph.replace(runPattern, (fullRun) => {
+          const run = plan.runs[runIndex];
+          runIndex += 1;
+          if (!run) return fullRun;
+          const part = parts[runIndex - 1] ?? "";
+          if (part.length === 0) {
+            return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${attributes}></w:t>`);
           }
-          return `<w:t${attributes}></w:t>`;
+          if (runIndex === 1) {
+            return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${ensurePreserve(run.tAttributes)}>${escapeXml(part)}</w:t>`);
+          }
+          return fullRun.replace(textPattern, (full, attributes: string) => `<w:t${ensurePreserve(run.tAttributes)}>${escapeXml(part)}</w:t>`);
         });
+
+        output += rebuiltParagraph;
       }
       output += xml.slice(lastIndex);
       return output;
@@ -90,16 +118,26 @@ function prepareDocxPart(xml: string): PartPlan {
 
 function preparePptxPart(xml: string, rtl: boolean): PartPlan {
   const segments: string[] = [];
-  const plans: { paragraph: string; segmentIndex: number }[] = [];
+  const plans: { paragraph: string; segmentIndex: number; runs: { full: string; attributes: string; text: string }[] }[] = [];
+  const runPattern = /<a:r\b[^>]*>[\s\S]*?<a:t\b([^>]*)>([\s\S]*?)<\/a:t>[\s\S]*?<\/a:r>/g;
   const textPattern = /<a:t\b([^>]*)>([\s\S]*?)<\/a:t>/g;
 
   for (const match of xml.matchAll(/<a:p\b[^>]*>[\s\S]*?<\/a:p>/g)) {
     const paragraph = match[0];
-    const texts = [...paragraph.matchAll(textPattern)].map((entry) => decodeXml(entry[2] ?? ""));
-    if (!texts.length) continue;
-    const joined = texts.join("");
+    const runs: { full: string; attributes: string; text: string }[] = [];
+
+    for (const runMatch of paragraph.matchAll(runPattern)) {
+      runs.push({
+        full: runMatch[0],
+        attributes: runMatch[1] ?? "",
+        text: decodeXml(runMatch[2] ?? ""),
+      });
+    }
+
+    if (!runs.length) continue;
+    const joined = runs.map((entry) => entry.text).join("");
     if (isEmptyText(joined)) continue;
-    plans.push({ paragraph, segmentIndex: segments.length });
+    plans.push({ paragraph, segmentIndex: segments.length, runs });
     segments.push(joined);
   }
 
@@ -117,15 +155,21 @@ function preparePptxPart(xml: string, rtl: boolean): PartPlan {
         output += xml.slice(lastIndex, paragraphIndex);
         lastIndex = paragraphIndex + plan.paragraph.length;
 
-        const translated = translations[plan.segmentIndex] ?? "";
-        let textCursor = 0;
-        let paragraph = plan.paragraph.replace(textPattern, (full, attributes: string) => {
-          const index = textCursor;
-          textCursor += 1;
-          if (index === 0) {
-            return `<a:t${ensurePreserve(attributes)}>${escapeXml(translated)}</a:t>`;
+        const originalJoined = plan.runs.map((entry) => entry.text).join("");
+        const translated = translations[plan.segmentIndex] ?? originalJoined;
+        const runLengths = plan.runs.map((entry) => entry.text.length);
+        const parts = splitByRuns(translated, runLengths);
+        let runIndex = 0;
+
+        let paragraph = plan.paragraph.replace(runPattern, (fullRun) => {
+          const run = plan.runs[runIndex];
+          runIndex += 1;
+          if (!run) return fullRun;
+          const part = parts[runIndex - 1] ?? "";
+          if (part.length === 0) {
+            return fullRun.replace(textPattern, (full, attributes: string) => `<a:t${attributes}></a:t>`);
           }
-          return `<a:t${attributes}></a:t>`;
+          return fullRun.replace(textPattern, (full, attributes: string) => `<a:t${ensurePreserve(run.attributes)}>${escapeXml(part)}</a:t>`);
         });
 
         // اتجاه فقرة DrawingML للغات من اليمين إلى اليسار فقط.
@@ -157,17 +201,24 @@ function preparePptxPart(xml: string, rtl: boolean): PartPlan {
 
 function prepareXlsxPart(xml: string, containerTag: "si" | "is"): PartPlan {
   const segments: string[] = [];
-  const plans: { block: string; segmentIndex: number }[] = [];
+  const plans: { block: string; segmentIndex: number; texts: { full: string; attributes: string; text: string }[] }[] = [];
   const blockPattern = new RegExp(`<${containerTag}\\b[^>]*>[\\s\\S]*?</${containerTag}>`, "g");
   const textPattern = /<t\b([^>]*)>([\s\S]*?)<\/t>/g;
 
   for (const match of xml.matchAll(blockPattern)) {
     const block = match[0];
-    const texts = [...block.matchAll(textPattern)].map((entry) => decodeXml(entry[2] ?? ""));
+    const texts: { full: string; attributes: string; text: string }[] = [];
+    for (const textMatch of block.matchAll(textPattern)) {
+      texts.push({
+        full: textMatch[0],
+        attributes: textMatch[1] ?? "",
+        text: decodeXml(textMatch[2] ?? ""),
+      });
+    }
     if (!texts.length) continue;
-    const joined = texts.join("");
+    const joined = texts.map((entry) => entry.text).join("");
     if (isEmptyText(joined)) continue;
-    plans.push({ block, segmentIndex: segments.length });
+    plans.push({ block, segmentIndex: segments.length, texts });
     segments.push(joined);
   }
 
@@ -185,15 +236,20 @@ function prepareXlsxPart(xml: string, containerTag: "si" | "is"): PartPlan {
         output += xml.slice(lastIndex, blockIndex);
         lastIndex = blockIndex + plan.block.length;
 
-        const translated = translations[plan.segmentIndex] ?? "";
+        const originalJoined = plan.texts.map((entry) => entry.text).join("");
+        const translated = translations[plan.segmentIndex] ?? originalJoined;
+        const runLengths = plan.texts.map((entry) => entry.text.length);
+        const parts = splitByRuns(translated, runLengths);
         let textCursor = 0;
+
         output += plan.block.replace(textPattern, (full, attributes: string) => {
           const index = textCursor;
           textCursor += 1;
-          if (index === 0) {
-            return `<t${ensurePreserve(attributes)}>${escapeXml(translated)}</t>`;
+          const part = parts[index] ?? "";
+          if (part.length === 0) {
+            return `<t${attributes}></t>`;
           }
-          return `<t${attributes}></t>`;
+          return `<t${ensurePreserve(plan.texts[index]?.attributes || attributes)}>${escapeXml(part)}</t>`;
         });
       }
 
